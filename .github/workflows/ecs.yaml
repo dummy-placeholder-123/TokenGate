@@ -57,8 +57,9 @@ jobs:
         env:
           ECR_REPO: ${{ secrets.ECR_REPO }}
         run: |
-          # Extract repository name (strip registry/namespace) for AWS CLI call
-          REPO_NAME="${ECR_REPO##*/}"
+          # Extract repository path from full ECR URI (keeps namespace if present)
+          # Example: 289956717103.dkr.ecr.us-east-1.amazonaws.com/devashish/tokengate -> devashish/tokengate
+          REPO_NAME="${ECR_REPO#*.amazonaws.com/}"
           IMAGE_TAG="${GITHUB_SHA::7}"
           # Fetch the digest for the pushed tag so ECS can pin to an immutable image
           # (immutable digests avoid "latest drift" and ensure rollback is possible)
