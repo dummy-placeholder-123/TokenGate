@@ -5,8 +5,8 @@ on:
     branches: [ "main" ]
 
 permissions:
-  id-token: write    # Needed for OIDC
-  contents: read     # Needed for checkout
+  id-token: write    # Allow OIDC federation to AWS without static keys
+  contents: read     # Required by actions/checkout to pull repo
 
 jobs:
   deploy:
@@ -14,39 +14,98 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v3 # Pull repository content
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4 # Install Temurin JDK for Maven build/test
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Run tests
+        run: mvn -B -q test # Fail fast if unit/integration tests break
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::289956717103:role/cicd
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: arn:aws:iam::289956717103:role/cicd # IAM role trusted for GitHub OIDC
+          aws-region: ${{ secrets.AWS_REGION }}               # Region used for ECR/ECS calls
 
       - name: Log in to ECR
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v1 # Creates docker login for ECR registry
 
-      # Enable ARM emulation on the GitHub-hosted runner
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v3 # Enable emulation so Buildx can build ARM on x86 runner
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v3 # Multi-platform builder
 
       - name: Build & Push ARM64 Image
         env:
           ECR_REPO: ${{ secrets.ECR_REPO }}
         run: |
+          # Tag images with short SHA for traceability and "latest" for convenience
+          IMAGE_TAG="${GITHUB_SHA::7}"
           docker buildx build \
             --platform linux/arm64 \
+            -t "$ECR_REPO:$IMAGE_TAG" \
             -t "$ECR_REPO:latest" \
             --push .
+
+      - name: Capture pushed image digest
+        env:
+          ECR_REPO: ${{ secrets.ECR_REPO }}
+        run: |
+          # Extract repository name (strip registry/namespace) for AWS CLI call
+          REPO_NAME="${ECR_REPO##*/}"
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          # Fetch the digest for the pushed tag so ECS can pin to an immutable image
+          # (immutable digests avoid "latest drift" and ensure rollback is possible)
+          IMAGE_DIGEST=$(aws ecr describe-images \
+            --repository-name "$REPO_NAME" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
+          # Fail fast if digest lookup failed (e.g., tag not found)
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ]; then
+            echo "Image digest not found for tag $IMAGE_TAG" >&2
+            exit 1
+          fi
+          echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=$ECR_REPO@$IMAGE_DIGEST" >> "$GITHUB_ENV"
+
+      - name: Register new task definition revision
+        env:
+          ECS_TASK_DEFINITION_FAMILY: ${{ secrets.ECS_TASK_DEFINITION_FAMILY }}
+        run: |
+          # Pull the current task definition JSON to use as a template
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION_FAMILY" \
+            --query 'taskDefinition' > task-def.json
+
+          # Clean read-only fields and swap in the new image URI
+          jq 'del(.status,.revision,.taskDefinitionArn,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
+            | .containerDefinitions[0].image = env.IMAGE_URI' \
+            task-def.json > task-def-updated.json
+
+          # Register a new task definition revision
+          NEW_TASK_DEF_ARN=$(
+            aws ecs register-task-definition \
+              --cli-input-json file://task-def-updated.json \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text
+          )
+          echo "NEW_TASK_DEF_ARN=$NEW_TASK_DEF_ARN" >> "$GITHUB_ENV"
 
       - name: Update ECS service
         env:
           ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
           ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
         run: |
+          # Point the service to the new task definition and roll out
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
+            --task-definition "$NEW_TASK_DEF_ARN" \
             --force-new-deployment
